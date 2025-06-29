@@ -1,145 +1,141 @@
+use linux_futex::{Futex, Shared, TimedWaitError};
+use shared_memory::ShmemConf;
 use std::env;
-use std::ffi::CString;
-use std::ptr;
-use std::sync::atomic;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
-// Use the same layout as parent
-const MUTEX_OFFSET: usize = 0;
-const NUMBER_OFFSET: usize = 256;
-const SHARED_MEMORY_SIZE: usize = 4096;
-
-unsafe fn get_mutex_ptr(shared_ptr: *mut u8) -> *mut libc::pthread_mutex_t {
-    shared_ptr.add(MUTEX_OFFSET) as *mut libc::pthread_mutex_t
+/// The data structure shared between the parent and child processes
+/// Must match exactly with the parent's SharedData structure
+#[repr(C)]
+struct SharedData {
+    pub futex: Futex<Shared>,
+    pub number: AtomicI64,
 }
 
-unsafe fn get_number_ptr(shared_ptr: *mut u8) -> *mut i64 {
-    shared_ptr.add(NUMBER_OFFSET) as *mut i64
+impl SharedData {
+    /// Get the current value of the shared number
+    pub fn get_number(&self) -> i64 {
+        self.number.load(Ordering::SeqCst)
+    }
+
+    /// Set the shared number to a new value
+    pub fn set_number(&self, value: i64) {
+        self.number.store(value, Ordering::SeqCst);
+    }
+
+    /// Acquire the futex lock with a timeout
+    pub fn lock_timeout(&self, timeout: Duration) -> Result<(), TimedWaitError> {
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check timeout
+            if start.elapsed() >= timeout {
+                return Err(TimedWaitError::TimedOut);
+            }
+
+            // Try to change futex value from 0 (unlocked) to 1 (locked)
+            match self
+                .futex
+                .value
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()), // Successfully acquired lock
+                Err(_) => {
+                    // Lock is contended, wait for it to be released with remaining timeout
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        return Err(TimedWaitError::TimedOut);
+                    }
+                    let _ = self.futex.wait_for(1, remaining)?;
+                }
+            }
+        }
+    }
+
+    /// Release the futex lock and wake up waiting processes
+    pub fn unlock(&self) {
+        self.futex.value.store(0, Ordering::Release);
+        self.futex.wake(1); // Wake up one waiting process
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 32-bit Child Process Started ===");
     println!("Child Process ID: {}", std::process::id());
 
-    // Get shared memory name from command line argument
+    // Get shared memory OS ID from command line argument
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        return Err("Usage: child_process <shared_memory_name>".into());
+        return Err("Usage: child_process <shared_memory_os_id>".into());
     }
 
-    let shm_name = CString::new(args[1].as_str())?;
+    let os_id = &args[1];
+    println!("Child: Opening shared memory with OS ID: {}", os_id);
 
-    // Open existing shared memory
-    let shm_fd = unsafe { libc::shm_open(shm_name.as_ptr(), libc::O_RDWR, 0) };
+    // Open the existing shared memory using the OS ID
+    let shmem = ShmemConf::new().os_id(os_id).open()?;
+    println!("Child: Successfully opened shared memory");
 
-    if shm_fd == -1 {
-        return Err("Child: Failed to open shared memory".into());
-    }
-
-    // Map the shared memory
-    let shared_ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            SHARED_MEMORY_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            shm_fd,
-            0,
-        )
-    };
-
-    if shared_ptr == libc::MAP_FAILED {
-        unsafe {
-            libc::close(shm_fd);
-        }
-        return Err("Child: Failed to map shared memory".into());
-    }
-
-    let shared_base = shared_ptr as *mut u8;
-    let mutex_ptr = unsafe { get_mutex_ptr(shared_base) };
-    let number_ptr = unsafe { get_number_ptr(shared_base) };
-
-    println!("Child: Shared memory mapped successfully");
+    // Get a pointer to the shared data
+    let shared_data_ptr = shmem.as_ptr() as *const SharedData;
+    let shared_data = unsafe { &*shared_data_ptr };
 
     // Verify we can read the shared data
-    unsafe {
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        let initial_number = *number_ptr;
-        println!("Child: Can see initial number: {}", initial_number);
-        if initial_number != 100 {
-            eprintln!(
-                "Child: Warning - expected initial number 100, got {}",
-                initial_number
-            );
+    let initial_number = shared_data.get_number();
+    println!("Child: Can see initial number: {}", initial_number);
+
+    if initial_number != 100 {
+        eprintln!(
+            "Child: Warning - expected initial number 100, got {}",
+            initial_number
+        );
+    }
+
+    // Attempt to acquire the lock (will block until parent releases it)
+    println!("Child: Attempting to acquire lock...");
+
+    // Use a timeout to avoid hanging indefinitely
+    const TIMEOUT_SECONDS: u64 = 10;
+    let timeout = Duration::from_secs(TIMEOUT_SECONDS);
+
+    match shared_data.lock_timeout(timeout) {
+        Ok(_) => {
+            println!("Child: Lock acquired successfully!");
+        }
+        Err(TimedWaitError::TimedOut) => {
+            return Err(format!(
+                "Child: Timeout waiting for lock after {} seconds",
+                TIMEOUT_SECONDS
+            )
+            .into());
+        }
+        Err(TimedWaitError::Interrupted) => {
+            return Err("Child: Lock attempt was interrupted".into());
+        }
+        Err(e) => {
+            return Err(format!("Child: Failed to acquire lock: {:?}", e).into());
         }
     }
 
-    // Try to acquire the mutex with timeout (will block until parent releases it)
-    unsafe {
-        println!("Child: Attempting to acquire mutex...");
+    // Read the current number
+    let current_number = shared_data.get_number();
+    println!("Child: Current number: {}", current_number);
 
-        // Try to acquire the mutex with a timeout mechanism
-        let timeout_seconds = 10;
-        let mut attempts = 0;
-        let max_attempts = timeout_seconds * 10; // 100ms intervals
+    // Child does math: add 25 and multiply by 2
+    let new_number = (current_number + 25) * 2;
+    shared_data.set_number(new_number);
 
-        loop {
-            let lock_result = libc::pthread_mutex_trylock(mutex_ptr);
+    println!("Child: Applied operation ((n + 25) * 2)");
+    println!("Child: New number: {}", new_number);
 
-            if lock_result == 0 {
-                // Successfully acquired the mutex
-                println!("Child: Mutex acquired after {} attempts!", attempts);
-                break;
-            } else if lock_result == libc::EBUSY {
-                // Mutex is busy, wait and try again
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!(
-                        "Child: Timeout waiting for mutex after {} seconds",
-                        timeout_seconds
-                    );
-                    return Err("Child: Timeout waiting for mutex".into());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            } else {
-                eprintln!("Child: Failed to acquire mutex with error: {}", lock_result);
-                return Err(format!("Child: Failed to acquire mutex: {}", lock_result).into());
-            }
-        }
+    // Simulate some work
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Read the current number
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        let current_number = *number_ptr;
-        println!("Child: Current number: {}", current_number);
+    // Release the lock
+    shared_data.unlock();
+    println!("Child: Lock released");
 
-        // Child does math: add 25 and multiply by 2
-        let new_number = (current_number + 25) * 2;
-        *number_ptr = new_number;
-
-        // Ensure the write is visible to other processes
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-
-        println!("Child: Applied operation ((n + 25) * 2)");
-        println!("Child: New number: {}", new_number);
-
-        // Simulate some work
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Release the mutex
-        let unlock_result = libc::pthread_mutex_unlock(mutex_ptr);
-        if unlock_result != 0 {
-            eprintln!("Child: Failed to unlock mutex: {}", unlock_result);
-            return Err(format!("Child: Failed to unlock mutex: {}", unlock_result).into());
-        }
-        println!("Child: Mutex released");
-    }
-
-    // Cleanup
-    unsafe {
-        libc::munmap(shared_ptr, SHARED_MEMORY_SIZE);
-        libc::close(shm_fd);
-    }
-
-    println!("=== Child process finished ===");
+    println!("=== Child process finished successfully ===");
 
     Ok(())
 }
